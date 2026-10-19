@@ -1,0 +1,38 @@
+# Start: docker compose up -d --build     Logs: docker compose logs -f
+# Requires .env next to this file (cp .env.example .env).
+# After editing .env or this file: docker compose up -d --force-recreate
+
+services:
+  webapp:
+    build: .
+    image: cairn-board:latest
+    container_name: cairn-board
+    restart: unless-stopped
+
+    # host:container — change only the left number.
+    ports:
+      - "5000:5000"
+
+    # Secrets and settings (CAIRN_SECRET_KEY, CAIRN_DM_PASSWORD, TZ, ...);
+    # see .env.example.
+    env_file:
+      - .env
+
+    # Run as the host user who owns ./data (PUID/PGID from .env; find them
+    # with `id -u` / `id -g`). No user account exists inside the image.
+    # Compose reads these from the .env next to this file automatically.
+    user: "${PUID:-1000}:${PGID:-1000}"
+
+    volumes:
+      # Everything the app reads or writes. Target must match CAIRN_DATA_DIR
+      # in the Dockerfile.
+      - ./data:/app/data
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    security_opt:
+      - no-new-privileges:true

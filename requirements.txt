@@ -1,0 +1,4 @@
+# Installed into the Docker image by the Dockerfile, or locally with
+#   pip install -r requirements.txt
+Flask>=3.1,<4.0    # the web app itself (3.1+ for the session/cookie handling app.py uses)
+waitress>=3.0,<4.0 # production WSGI server the container runs app.py under

@@ -1,0 +1,26 @@
+# Only requirements.txt and app.py belong in the image; everything else is
+# kept out of the build context.
+
+# Game state and secrets: data arrives through the ./data bind mount and
+# secrets through env_file, so neither must ever be baked into the image.
+data/
+.env
+.env.example
+
+# Python caches.
+__pycache__/
+*.pyc
+
+# Version control and editor/assistant settings.
+.git/
+.gitignore
+.claude/
+
+# Old copies of app.py (some contain hard-coded passwords).
+old versions/
+
+# Docs and Docker's own files, which the running app never reads.
+README.md
+docker-compose.yml
+Dockerfile
+.dockerignore

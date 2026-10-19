@@ -1,0 +1,15 @@
+# Real secrets. Commit .env.example instead.
+.env
+
+# Game state written at runtime. data/documents/ (table documents) is
+# content and is not ignored.
+data/*.json
+data/*.txt
+data/*.tmp
+data/.write-test
+data/backups/
+
+# Python caches.
+__pycache__/
+*.pyc
+.env

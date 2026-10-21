@@ -2,8 +2,9 @@
 
 A small, self-hosted play-by-post message board for running
 [Cairn](https://cairnrpg.com/first-edition/cairn-srd/) (First Edition) games.
-It's one Python file (`app.py`) with no database, built to run comfortably on
-a Raspberry Pi in Docker.
+It's one Python file (`app.py`), built to run comfortably on a Raspberry Pi
+in Docker. All game state is stored in one SQLite file in `data/`. SQLite is
+built into Python, so there's no database server to run.
 
 Players make a character with the SRD creation tables, post to a shared feed,
 roll dice, and keep their sheets up to date. The DM gets a dashboard to post,
@@ -42,7 +43,7 @@ whisper, manage every character, and share table documents.
   - Each document can be kept DM-only or shared with players.
   - Files can also be dropped straight into `data/documents/`.
 - **Backups.** Download a one-click zip of the whole game and import it again later. The current game is auto-saved before every import, so an import can be undone.
-- **Activity log.** An append-only `data/Activity Log.txt` records every change.
+- **Activity log.** An append-only log in the database records every change.
 - **Rate limits.** Failed logins, posts and rolls are rate-limited.
 
 ## Project layout
@@ -61,7 +62,8 @@ cairnapp/
     data/                  the only folder the app writes to
         documents/         table documents (content; upload or drop files in)
         backups/           automatic saves taken before each import
-        *.json, Activity Log.txt   game state, created at runtime
+        cairn.db (+ -wal, -shm)    game state + activity log (SQLite, created at runtime)
+        legacy-json/       old JSON files, moved here once imported
 ```
 
 Everything the game needs to survive a rebuild is in `data/`. The image holds
@@ -129,7 +131,8 @@ sizes.
    docker compose logs -f
    ```
 
-   The first line should be `[cairn] data directory: /app/data`. The board is
+   The first lines should be `[cairn] data directory: /app/data` and
+   `[cairn] database: /app/data/cairn.db`. The board is
    at `http://<pi-address>:5000`; the DM dashboard at `/dm`.
 
 5. **After editing `.env` or `docker-compose.yml`**, run
@@ -164,33 +167,60 @@ saved in `data/` next to `app.py`.
 
 ## Data and backups
 
-| File in `data/` | Written by | Contents |
+All game state lives in one SQLite database, `data/cairn.db`, created on
+first start. The table documents stay ordinary files in `data/documents/`.
+
+| Path in `data/` | Written by | Holds |
 |---|---|---|
-| `Characters.json` | character creation, sheet edits, DM editor | Characters, including player logins |
-| `Hidden Message Board.json` | posts, edits, rolls | All posts, including whispers |
-| `Scene.json` | DM sets the scene | Scene name |
-| `DMNotes.json` | DM notes page | The DM's private notes |
-| `Documents.json` | DM documents shelf | Document titles and who can see them |
+| `cairn.db` | every change | Everything: posts (including whispers), characters and their logins, scene name, DM notes, the document index, and the activity log |
+| `cairn.db-wal`, `cairn.db-shm` | SQLite | SQLite's working files. They belong to `cairn.db`; never delete or copy one without the others |
 | `documents/` | DM uploads, or you dropping files in | The table documents themselves |
-| `Activity Log.txt` | every change | Append-only audit trail |
-| `backups/` | Import Backup | Automatic saves taken before each import (newest 10 kept) |
+| `backups/` | Import Backup | Automatic zip snapshots of the game, saved before each import (newest 10 kept) |
+| `legacy-json/` | first start after upgrading | The old JSON files and `Activity Log.txt`, moved here after being imported (see below) |
 
-Files are written atomically, so a crash or power cut never leaves one half
-written. If a state file is damaged anyway, for example after a hand edit, the
-app **refuses to start** rather than overwrite it. Restore the file from a
-backup, or move it aside, and start again.
+Inside the database:
 
-**Back up** with **Download Backup** on the DM dashboard, or by copying the
-whole `data/` folder (a cron job copying `./data` elsewhere works well).
+| Table | Holds |
+|---|---|
+| `posts` | One row per post. The whole post is JSON in `data`; `seq`, author, whisper target etc. are copied into columns for querying |
+| `characters` | One row per character, likewise: whole sheet in `data`, plus `username`, `name`, `dead` |
+| `documents` | One row per table document: file name, title, shared with players or not |
+| `activity_log` | Append-only audit trail of every player and DM action (`ts`, `actor`, `action`, `details`) |
+| `meta` | Scene name, DM notes, schema version and the backup-import epoch |
+| `client_map` | Legacy browser links from before logins; empties itself over time |
 
-**Reset** to a fresh game: stop the container, move `data/` aside (keep it
-until you're sure), `mkdir data`, fix its ownership as in step 3, and start
-again. To keep the documents, move `data/documents/` back in.
+Every save is one transaction, so a crash or power cut leaves the database
+either fully before or fully after a change. If the database is damaged, or
+was written by a newer `app.py`, the app **refuses to start** rather than
+touch it.
 
-**Moving an existing game in:** stop the container, copy the state files and
-the `documents` folder from the old install into `data/`, fix ownership, and
-start. Or download a backup from the old board and use **Import Backup** on
-the new one.
+You can browse it with `sqlite3 data/cairn.db` or DB Browser for SQLite, even
+while the app is running. Don't edit it while the app is running: the app
+keeps the game in memory and would overwrite your change.
+
+**Backing up.** **Download Backup** on the DM dashboard gives a zip of
+readable JSON files, the activity log as text, and every table document. It's
+the same format the app used before it switched to SQLite, so old and new
+backups both import. Copying `data/` works too, but only while the app is
+stopped (`docker compose stop`): a copy of a live database can miss its newest
+changes.
+
+**Reset** to a fresh game: stop the container and move `cairn.db`,
+`cairn.db-wal` and `cairn.db-shm` out of `data/` (keep them until you're
+sure). Leave `documents/` in place to keep the documents; they're picked up
+again, DM-only, on the next page load.
+
+**Upgrading from the JSON version.** On the first start after upgrading, any
+`Characters.json`, `Hidden Message Board.json`, `Scene.json`, `DMNotes.json`,
+`Documents.json` and `Activity Log.txt` in `data/` are imported in one go,
+then moved into `data/legacy-json/<date-time>/`. Nothing is deleted. If one of
+them is damaged, the app refuses to start and imports nothing. Once you're
+happy the game looks right, you can delete `legacy-json/`.
+
+**Moving an existing game in:** download a backup from the old board and use
+**Import Backup** on the new one. Or stop the container, copy the old
+install's JSON files and `documents` folder into `data/` (with no `cairn.db`
+there yet), fix ownership, and start; they're imported as above.
 
 ## Running behind a reverse proxy (HTTPS)
 
@@ -208,7 +238,7 @@ localhost only with `"127.0.0.1:5000:5000"` in `docker-compose.yml`.
 | Symptom | Likely cause |
 |---|---|
 | `env file ... not found` | `.env` didn't copy over (dotfiles skipped) or isn't next to `docker-compose.yml`. |
-| Container keeps restarting | Run `docker compose logs`. "is not set" means a required variable is missing from `.env`. "Cannot write to the data directory" means `./data` isn't owned/writable by `PUID:PGID` (step 3). "Cannot read …json" means a damaged state file. |
+| Container keeps restarting | Run `docker compose logs`. "is not set" means a required variable is missing from `.env`. "Cannot write to the data directory" means `./data` isn't owned/writable by `PUID:PGID` (step 3). "Cannot read …cairn.db" means a damaged database; "Cannot read …json" a damaged old JSON file being imported. |
 | Permission denied on `/app/data` although you ran `chown` | You fixed a different copy of the project. `docker inspect cairn-board` → `Binds` shows the folder actually mounted; fix that one, including `chmod -R u+rwX`. |
 | `.env` change has no effect | Use `docker compose up -d --force-recreate`, not `restart`. |
 | Everyone logged out after a restart | `CAIRN_SECRET_KEY` changed. |

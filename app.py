@@ -1,13 +1,15 @@
 from flask import Flask, request, redirect, url_for, flash, jsonify, session, send_file, Response, abort
 from datetime import datetime, timedelta
+from contextlib import contextmanager
 from html import escape, unescape
 import io
 import json
-import logging
 import os
 import random
 import re
 import secrets
+import sqlite3
+import sys
 import threading
 import time
 import unicodedata
@@ -134,7 +136,7 @@ CAIRN_RULES_URL = 'https://cairnrpg.com/first-edition/cairn-srd/'
 CAIRN_BESTIARY_URL = 'https://cairnrpg.com/resources/monsters/'
 
 # Player logins. Every character gets a generated username/password pair the
-# moment it is created, stored server-side in Characters.json so the DM can
+# moment it is created, stored server-side with the character so the DM can
 # read them back to a player who forgets. Usernames are two woodland words and
 # a number; passwords skip look-alike characters (0/O, 1/l/I) so they survive
 # being read aloud across the table.
@@ -312,8 +314,8 @@ MAX_CONDITION_MOD = 6
 # Backup import. The upload limit is separate from the 64KB cap on every
 # other request; the uncompressed limit stops a tiny zip that inflates to
 # gigabytes. Backups carry the table documents too, so these are roomy.
-# Before an import replaces anything, the current game is saved to backups/
-# next to the other state files, keeping the newest few.
+# Before an import replaces anything, the current game is saved to
+# data/backups/ as a zip, keeping the newest few.
 IMPORT_MAX_UPLOAD = 200 * 1024 * 1024
 IMPORT_MAX_UNCOMPRESSED = 400 * 1024 * 1024
 KEEP_AUTO_BACKUPS = 10
@@ -458,14 +460,11 @@ def save_outcome(roll_value, score):
 # container user has no home directory, and /app itself is owned by root.
 #
 #   data/
-#       Hidden Message Board.json   all posts, including whispers
-#       Characters.json             characters and player logins
-#       Scene.json                  scene name
-#       DMNotes.json                the DM's private notes
-#       Documents.json              document titles and who can see them
-#       Activity Log.txt            append-only audit trail
+#       cairn.db (+ -wal, -shm)     game state, document index and activity
+#                                   log (SQLite)
 #       documents/                  table documents (uploaded, or dropped in)
 #       backups/                    automatic saves taken before each import
+#       legacy-json/                old JSON files, moved here once imported
 DATA_DIR = os.environ.get('CAIRN_DATA_DIR') or os.path.join(BASE_DIR, 'data')
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -491,20 +490,31 @@ except OSError as _exc:
 
 print(f'[cairn] data directory: {DATA_DIR}', flush=True)
 
-DATA_FILE = os.path.join(DATA_DIR, 'Hidden Message Board.json')
-CHAR_FILE = os.path.join(DATA_DIR, 'Characters.json')
-LOG_FILE = os.path.join(DATA_DIR, 'Activity Log.txt')
-SCENE_FILE = os.path.join(DATA_DIR, 'Scene.json')
+# Every post, character, scene name, note, document entry and activity-log
+# line lives in one SQLite database (see "SQLite storage" below).
+DB_FILE = os.path.join(DATA_DIR, 'cairn.db')
+
+# The files the game used to be kept in. Their names are still the names
+# inside a backup zip, and if any are found in data/ on startup they're
+# imported into the database once and moved to LEGACY_DIR.
+POSTS_JSON = 'Hidden Message Board.json'
+CHARACTERS_JSON = 'Characters.json'
+SCENE_JSON = 'Scene.json'
+DM_NOTES_JSON = 'DMNotes.json'
+DOCUMENTS_JSON = 'Documents.json'
+ACTIVITY_LOG_TXT = 'Activity Log.txt'
+STATE_JSON_FILES = (POSTS_JSON, CHARACTERS_JSON, SCENE_JSON, DM_NOTES_JSON)
+LEGACY_DIR = os.path.join(DATA_DIR, 'legacy-json')
 
 # ---------------------------------------------------------------------------
 # Table documents: handouts, maps, adventures, house rules — anything the DM
 # uploads from the dashboard, or drops straight into the documents folder
 # (it's picked up on the next page load). Documents start DM-only; the DM can
-# share any of them with the players. Documents.json remembers titles and
-# who can see what; the files themselves sit in the folder untouched.
+# share any of them with the players. The database's documents table
+# remembers titles and who can see what; the files themselves sit in the
+# folder untouched.
 # ---------------------------------------------------------------------------
 DOCS_DIR = os.path.join(DATA_DIR, 'documents')
-DOCS_FILE = os.path.join(DATA_DIR, 'Documents.json')
 os.makedirs(DOCS_DIR, exist_ok=True)
 DOC_MAX_UPLOAD = 25 * 1024 * 1024
 MAX_DOC_TITLE = 80
@@ -528,60 +538,80 @@ DEFAULT_SCENE_NAME = 'Into the Woods'
 MAX_SCENE_LENGTH = 60
 
 # Private notes: one page per character, plus one for the DM. Only the owner
-# can read or write theirs. Character notes live on the character in
-# Characters.json; the DM's live in their own file.
+# can read or write theirs. Character notes are stored on the character;
+# the DM's are a row in the database's meta table.
 MAX_NOTES_LENGTH = 500
-DM_NOTES_FILE = os.path.join(DATA_DIR, 'DMNotes.json')
 
-# Append-only audit trail of every player and DM change. Uses the logging
-# module (not a manual open()/write()) because FileHandler is thread-safe —
-# the dev server runs with threaded=True, so concurrent requests could
-# otherwise interleave or clobber each other's writes to the same file.
-activity_logger = logging.getLogger('activity')
-activity_logger.setLevel(logging.INFO)
-activity_logger.propagate = False  # don't also spam Flask's own console logger
-if not activity_logger.handlers:
-    _handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
-    _handler.setFormatter(logging.Formatter('%(asctime)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
-    activity_logger.addHandler(_handler)
+# ---------------------------------------------------------------------------
+# SQLite storage
+#
+# The game is still worked on in memory (`posts`, `characters`, `documents`,
+# `scene_name` and friends below) and routes change those directly. Only the
+# way it reaches disk is different: save_posts() and save_characters()
+# compare each post and character with what was last written and write just
+# the ones that changed, in a single transaction, so a crash leaves the
+# database either fully before or fully after a change, never halfway.
+#
+# Each post and character is stored whole as JSON in a `data` column, with
+# the fields worth querying (seq, author, username, ...) copied into real
+# columns beside it. Splitting a character sheet across a dozen tables would
+# mean rewriting every route for no gain at this size. Document entries are
+# small and flat, so they get plain columns.
+#
+# There is one connection, used only while holding state_lock, so threads
+# never use it at the same time. WAL mode means the file can be opened with
+# the sqlite3 tool or DB Browser for SQLite while the app is running.
+# ---------------------------------------------------------------------------
+SCHEMA_VERSION = 1
 
-
-def log_activity(actor, action, details=''):
-    msg = f'{actor} | {action}'
-    if details:
-        msg += f' | {details}'
-    activity_logger.info(msg)
-
-
-def write_json_atomic(path, data):
-    """Write JSON so the file on disk is always either the old version or
-    the new one, never half of each: write a temp file in the same directory,
-    flush it to disk, then swap it into place with os.replace() (atomic on
-    the same filesystem). A crash mid-write leaves only a stray temp file,
-    which is cleaned up on the next start."""
-    tmp = f'{path}.{os.getpid()}.{threading.get_ident()}.tmp'
-    with state_lock:
-        try:
-            with open(tmp, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-            raise
-        # Make the rename itself durable (POSIX; harmless to skip elsewhere).
-        try:
-            dir_fd = os.open(os.path.dirname(path) or '.', os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except (OSError, AttributeError):
-            pass
+SCHEMA = '''
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,   -- schema_version, epoch, scene_name, dm_notes, ...
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS characters (
+    id       TEXT PRIMARY KEY,
+    username TEXT,
+    name     TEXT,
+    dead     INTEGER NOT NULL DEFAULT 0,
+    data     TEXT NOT NULL      -- the whole character, as JSON
+);
+CREATE INDEX IF NOT EXISTS characters_username ON characters (username COLLATE NOCASE);
+-- LEGACY browser-cookie links, see load_character_store().
+CREATE TABLE IF NOT EXISTS client_map (
+    client_id    TEXT PRIMARY KEY,
+    character_id TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS posts (
+    id                  TEXT PRIMARY KEY,
+    seq                 INTEGER NOT NULL,   -- feed order
+    change              INTEGER NOT NULL DEFAULT 0,
+    created_at          REAL,
+    author_character_id TEXT,
+    is_dm               INTEGER NOT NULL DEFAULT 0,
+    is_private          INTEGER NOT NULL DEFAULT 0,
+    target_character_id TEXT,
+    data                TEXT NOT NULL       -- the whole post, as JSON
+);
+CREATE INDEX IF NOT EXISTS posts_seq ON posts (seq);
+CREATE INDEX IF NOT EXISTS posts_author ON posts (author_character_id);
+-- Table documents. The files themselves are in data/documents/.
+CREATE TABLE IF NOT EXISTS documents (
+    id     TEXT PRIMARY KEY,
+    file   TEXT NOT NULL,       -- file name in data/documents/
+    title  TEXT NOT NULL,
+    shared INTEGER NOT NULL DEFAULT 0,  -- 1 = players can see it
+    added  TEXT NOT NULL DEFAULT ''
+);
+-- Append-only audit trail of every player and DM action.
+CREATE TABLE IF NOT EXISTS activity_log (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      TEXT NOT NULL,      -- local time (TZ), YYYY-MM-DD HH:MM:SS
+    actor   TEXT NOT NULL,
+    action  TEXT NOT NULL,
+    details TEXT NOT NULL DEFAULT ''
+);
+'''
 
 
 def refuse_to_start_with_damaged_file(path, exc):
@@ -596,9 +626,130 @@ def refuse_to_start_with_damaged_file(path, exc):
     )
 
 
+def refuse_to_start_with_damaged_db(exc):
+    raise SystemExit(
+        f'\nCannot read {DB_FILE}\n  {exc}\n\n'
+        'The app has NOT started, so nothing has been changed.\n'
+        'Restore data/ from a copy you made, or stop the app, move cairn.db\n'
+        '(and any cairn.db-wal / -shm next to it) out of data/, start again\n'
+        'and import a "Download backup" zip from the DM dashboard.\n'
+    )
+
+
+def open_db():
+    try:
+        db = sqlite3.connect(DB_FILE, isolation_level=None, check_same_thread=False)
+        db.execute('PRAGMA journal_mode=WAL')
+        # FULL rather than NORMAL: a Pi can lose power at any moment, and with
+        # FULL a save that has returned is really on disk. Writes here are
+        # small and infrequent, so the extra fsync costs nothing noticeable.
+        db.execute('PRAGMA synchronous=FULL')
+        # Wait rather than fail if the sqlite3 tool briefly holds a lock.
+        db.execute('PRAGMA busy_timeout=5000')
+        check = db.execute('PRAGMA quick_check').fetchone()[0]
+        if check != 'ok':
+            raise sqlite3.DatabaseError(check)
+        db.executescript(SCHEMA)
+        row = db.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    except sqlite3.Error as exc:
+        refuse_to_start_with_damaged_db(exc)
+    if row is None:
+        db.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
+    elif int(row[0]) > SCHEMA_VERSION:
+        raise SystemExit(
+            f'\n{DB_FILE} was written by a newer version of this app '
+            f'(schema {row[0]}, this one understands {SCHEMA_VERSION}).\n'
+            'Update app.py rather than run an old copy against it.\n'
+        )
+    return db
+
+
+_db = open_db()
+print(f'[cairn] database: {DB_FILE}', flush=True)
+
+
+@contextmanager
+def db_transaction():
+    """Group writes so they all land or none do. A call inside another one
+    joins the outer transaction, so e.g. save_characters() during a backup
+    import commits (or rolls back) together with the rest of the import."""
+    with state_lock:
+        if _db.in_transaction:
+            yield _db
+            return
+        _db.execute('BEGIN IMMEDIATE')
+        try:
+            yield _db
+        except BaseException:
+            _db.execute('ROLLBACK')
+            raise
+        _db.execute('COMMIT')
+
+
+def get_meta(key, default=''):
+    with state_lock:
+        row = _db.execute('SELECT value FROM meta WHERE key = ?', (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_meta(key, value):
+    with db_transaction() as db:
+        db.execute('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)', (key, value))
+
+
+def to_json(obj):
+    """Stable JSON for a stored post or character. sort_keys makes the text
+    the same every time for the same data, which is what lets the save
+    functions tell an unchanged row from a changed one."""
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+
+
+def log_activity(actor, action, details=''):
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        with db_transaction() as db:
+            db.execute('INSERT INTO activity_log (ts, actor, action, details) VALUES (?, ?, ?, ?)',
+                       (ts, str(actor), str(action), str(details or '')))
+    except sqlite3.Error as exc:
+        # The log is an audit trail, not game state: losing one line is
+        # better than failing the player's request that caused it.
+        print(f'[cairn] could not write to the activity log: {exc}', file=sys.stderr, flush=True)
+
+
+def activity_log_text():
+    """The whole activity log in the old 'Activity Log.txt' layout, for the
+    backup zip."""
+    with state_lock:
+        rows = _db.execute('SELECT ts, actor, action, details FROM activity_log ORDER BY id').fetchall()
+    return ''.join(f'{ts} | {actor} | {action}' + (f' | {details}' if details else '') + '\n'
+                   for ts, actor, action, details in rows)
+
+
+_LOG_LINE_RE = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \| (.*)$')
+
+
+def parse_activity_log(text):
+    """Rows for activity_log from an old 'Activity Log.txt'. A line that
+    doesn't start with a timestamp is the continuation of a message that
+    spanned lines, so it's joined onto the entry before it."""
+    rows = []
+    for line in text.splitlines():
+        m = _LOG_LINE_RE.match(line)
+        if m:
+            parts = m.group(2).split(' | ', 2)
+            parts += [''] * (3 - len(parts))
+            rows.append([m.group(1), *parts])
+        elif rows:
+            rows[-1][3] += '\n' + line
+        elif line.strip():
+            rows.append(['', '', '', line])
+    return rows
+
+
 def load_json_file(path):
-    """{} if the file doesn't exist yet; stops the app if it exists but is
-    damaged (see refuse_to_start_with_damaged_file)."""
+    """{} if the file doesn't exist; stops the app if it exists but is
+    damaged (see refuse_to_start_with_damaged_file). Only used to read the
+    JSON files from before the switch to SQLite."""
     if not os.path.exists(path):
         return {}
     try:
@@ -609,23 +760,19 @@ def load_json_file(path):
 
 
 def load_scene_name():
-    data = load_json_file(SCENE_FILE)
-    name = data.get('scene_name', '').strip() if isinstance(data, dict) else ''
-    return name or DEFAULT_SCENE_NAME
+    return get_meta('scene_name').strip() or DEFAULT_SCENE_NAME
 
 
 def save_scene_name(name):
-    write_json_atomic(SCENE_FILE, {'scene_name': name})
+    set_meta('scene_name', name)
 
 
 def load_dm_notes():
-    data = load_json_file(DM_NOTES_FILE)
-    notes = data.get('notes', '') if isinstance(data, dict) else ''
-    return notes if isinstance(notes, str) else ''
+    return get_meta('dm_notes')
 
 
 def save_dm_notes(notes):
-    write_json_atomic(DM_NOTES_FILE, {'notes': notes})
+    set_meta('dm_notes', notes)
 
 
 def clean_notes(value):
@@ -638,22 +785,15 @@ def clean_notes(value):
     return value.rstrip()
 
 
-def load_posts():
-    if not os.path.exists(DATA_FILE):
-        return []
-    try:
-        with open(DATA_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
-        refuse_to_start_with_damaged_file(DATA_FILE, exc)
-    if not isinstance(data, list):
-        refuse_to_start_with_damaged_file(DATA_FILE, 'expected a list of posts')
-
-    # Same defensive defaults as load_character_store: this file is plain JSON
-    # next to the script, and a hand-edited post missing a field shouldn't be
-    # able to break the feed.
+def fill_post_defaults(data):
+    """Defensive defaults for every post, so an old or hand-edited post
+    missing a field can't break the feed. A missing or repeated id gets a
+    fresh one, since the id is the post's key in the database."""
+    seen = set()
     for i, p in enumerate(data):
-        p.setdefault('id', str(uuid.uuid4()))
+        if not p.get('id') or p['id'] in seen:
+            p['id'] = str(uuid.uuid4())
+        seen.add(p['id'])
         p.setdefault('is_dm', False)
         p.setdefault('color', PLAYER_COLORS[0])
         p.setdefault('is_private', False)
@@ -674,13 +814,82 @@ def load_posts():
     return data
 
 
+# What was last written for each post / character / legacy link, so a save
+# only touches the rows that actually changed.
+_written_posts = {}       # post id -> JSON
+_written_characters = {}  # character id -> JSON
+_written_client_map = {}  # client id -> character id
+
+
+def _post_row(p, text):
+    created = p.get('created_at')
+    return (p['id'], int(p.get('seq', 0)), int(p.get('change', 0)),
+            created if isinstance(created, (int, float)) else None,
+            p.get('author_character_id'), 1 if p.get('is_dm') else 0,
+            1 if p.get('is_private') else 0, p.get('target_character_id'), text)
+
+
+_POST_INSERT = ('INSERT OR REPLACE INTO posts (id, seq, change, created_at, author_character_id, '
+                'is_dm, is_private, target_character_id, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+_CHARACTER_INSERT = 'INSERT OR REPLACE INTO characters (id, username, name, dead, data) VALUES (?, ?, ?, ?, ?)'
+_DOCUMENT_INSERT = 'INSERT INTO documents (id, file, title, shared, added) VALUES (?, ?, ?, ?, ?)'
+
+
+def load_posts():
+    """Every post, in feed order."""
+    global _written_posts
+    with state_lock:
+        try:
+            rows = _db.execute('SELECT id, data FROM posts ORDER BY seq, rowid').fetchall()
+        except sqlite3.Error as exc:
+            refuse_to_start_with_damaged_db(exc)
+    data, written = [], {}
+    for post_id, text in rows:
+        try:
+            post = json.loads(text)
+        except json.JSONDecodeError as exc:
+            refuse_to_start_with_damaged_db(f'post {post_id}: {exc}')
+        if not isinstance(post, dict):
+            refuse_to_start_with_damaged_db(f'post {post_id} is not an object')
+        post['id'] = post_id
+        data.append(post)
+        written[post_id] = text
+    _written_posts = written
+    return fill_post_defaults(data)
+
+
 def save_posts():
-    write_json_atomic(DATA_FILE, posts)
+    """Write the posts added, edited or removed since the last save."""
+    global _written_posts
+    current = {p['id']: to_json(p) for p in posts}
+    with db_transaction() as db:
+        db.executemany('DELETE FROM posts WHERE id = ?',
+                       [(post_id,) for post_id in _written_posts.keys() - current.keys()])
+        db.executemany(_POST_INSERT, [_post_row(p, current[p['id']]) for p in posts
+                                      if _written_posts.get(p['id']) != current[p['id']]])
+    _written_posts = current
+
+
+def write_characters(chars, cmap):
+    """Write the characters and legacy links that changed since the last
+    write."""
+    global _written_characters, _written_client_map
+    current = {char_id: to_json(c) for char_id, c in chars.items()}
+    cmap = dict(cmap)
+    with db_transaction() as db:
+        db.executemany('DELETE FROM characters WHERE id = ?',
+                       [(char_id,) for char_id in _written_characters.keys() - current.keys()])
+        db.executemany(_CHARACTER_INSERT,
+                       [(char_id, c.get('username'), c.get('name'), 1 if c.get('dead') else 0, current[char_id])
+                        for char_id, c in chars.items() if _written_characters.get(char_id) != current[char_id]])
+        if cmap != _written_client_map:
+            db.execute('DELETE FROM client_map')
+            db.executemany('INSERT INTO client_map (client_id, character_id) VALUES (?, ?)', list(cmap.items()))
+    _written_characters, _written_client_map = current, cmap
 
 
 def save_characters():
-    write_json_atomic(CHAR_FILE, {'characters': characters, 'client_map': client_map,
-                                  'epoch': state_epoch})
+    write_characters(characters, client_map)
 
 
 def generate_username(taken):
@@ -731,19 +940,29 @@ def load_character_store():
                 automatically on its next visit (see get_character()); each
                 entry is consumed the first time it is used.
 
-    Missing fields are filled in with safe defaults on the way through. Nothing
-    written by this app should ever be missing them, but the file is plain JSON
-    sitting next to the script and is easy to hand-edit, so a typo there
-    shouldn't take the board down.
+    Missing fields are filled in with safe defaults on the way through.
+    Nothing written by this app should ever be missing them, but characters
+    can arrive from old JSON files or a backup zip, which are easy to
+    hand-edit, so a typo there shouldn't take the board down.
     """
-    raw = load_json_file(CHAR_FILE)
-
-    if isinstance(raw, dict) and 'characters' in raw and 'client_map' in raw:
-        chars = raw['characters']
-        cmap = raw['client_map']
-    else:
-        chars = {}
-        cmap = {}
+    global _written_characters, _written_client_map
+    with state_lock:
+        try:
+            rows = _db.execute('SELECT id, data FROM characters').fetchall()
+            cmap = dict(_db.execute('SELECT client_id, character_id FROM client_map').fetchall())
+        except sqlite3.Error as exc:
+            refuse_to_start_with_damaged_db(exc)
+    chars = {}
+    for char_id, text in rows:
+        try:
+            char = json.loads(text)
+        except json.JSONDecodeError as exc:
+            refuse_to_start_with_damaged_db(f'character {char_id}: {exc}')
+        if not isinstance(char, dict):
+            refuse_to_start_with_damaged_db(f'character {char_id} is not an object')
+        chars[char_id] = char
+    _written_characters = dict(rows)
+    _written_client_map = dict(cmap)
 
     changed = False
 
@@ -835,35 +1054,179 @@ def load_character_store():
 
     if changed:
         # Write the filled-in defaults back so this only has to happen once
-        store = {'characters': chars, 'client_map': cmap}
-        if isinstance(raw, dict) and raw.get('epoch'):
-            store['epoch'] = raw['epoch']
-        write_json_atomic(CHAR_FILE, store)
+        write_characters(chars, cmap)
 
     return chars, cmap
 
 
-# Temp files left by a crash in the middle of write_json_atomic(). The real
-# file next to each is intact (the swap never happened), so these are safe
-# to throw away.
-for _name in os.listdir(DATA_DIR):
-    if _name.endswith('.tmp') and any(
-            _name.startswith(os.path.basename(f) + '.')
-            for f in (DATA_FILE, CHAR_FILE, SCENE_FILE, DM_NOTES_FILE, DOCS_FILE)):
+# ---------------------------------------------------------------------------
+# Game files: the JSON layout the app used before SQLite. It's still the
+# layout inside a backup zip, so a backup is readable on its own and
+# backups from before the switch import the same as new ones.
+# ---------------------------------------------------------------------------
+class BackupProblem(ValueError):
+    """Game files that can't be used; the message is shown to the DM."""
+
+
+def check_game_files(found):
+    """Validate {file name: parsed JSON} for the state files and
+    Documents.json, filling in what a file may leave out. Raises
+    BackupProblem with a readable reason."""
+    posts_data = found.get(POSTS_JSON, [])
+    if not isinstance(posts_data, list) or not all(isinstance(p, dict) for p in posts_data):
+        raise BackupProblem(f'{POSTS_JSON} is not a list of posts.')
+
+    store = found.get(CHARACTERS_JSON) or {'characters': {}, 'client_map': {}}
+    if (not isinstance(store, dict) or not isinstance(store.get('characters'), dict)
+            or not isinstance(store.get('client_map', {}), dict)
+            or not all(isinstance(c, dict) for c in store['characters'].values())):
+        raise BackupProblem(f'{CHARACTERS_JSON} is not a character file.')
+    store.setdefault('client_map', {})
+    found[CHARACTERS_JSON] = store
+
+    for name, key in ((SCENE_JSON, 'scene_name'), (DM_NOTES_JSON, 'notes')):
+        if name in found and not (isinstance(found[name], dict) and isinstance(found[name].get(key, ''), str)):
+            raise BackupProblem(f'{name} is not in the expected format.')
+
+    if DOCUMENTS_JSON in found:
+        index = found[DOCUMENTS_JSON]
+        if not isinstance(index, dict) or not isinstance(index.get('documents', []), list):
+            raise BackupProblem(f'{DOCUMENTS_JSON} is not in the expected format.')
+    return found
+
+
+def document_rows(raw):
+    """Rows for the documents table from a Documents.json list. Entries
+    without a file name are dropped, and a missing or repeated id gets a
+    fresh one. Titles are tidied when they're loaded (load_documents)."""
+    rows, seen = [], set()
+    for d in raw:
+        if not isinstance(d, dict) or not isinstance(d.get('file'), str) or not d['file']:
+            continue
+        doc_id = str(d.get('id') or '')
+        if not doc_id or doc_id in seen:
+            doc_id = secrets.token_hex(6)
+        seen.add(doc_id)
+        rows.append((doc_id, d['file'], str(d.get('title') or ''),
+                     1 if d.get('shared') else 0, str(d.get('added') or '')))
+    return rows
+
+
+def install_game_files(files):
+    """Make the database hold exactly the game in `files` (as returned by
+    check_game_files). A part the files don't include is emptied: the backup
+    was made before that part of the game had anything in it. The one
+    exception is the document index, which is only replaced when the files
+    include Documents.json (backups from before table documents existed
+    leave the current documents alone). The activity log is left alone too;
+    it records every game this board has run."""
+    posts_data = fill_post_defaults([dict(p) for p in files.get(POSTS_JSON, [])])
+    store = files.get(CHARACTERS_JSON, {'characters': {}, 'client_map': {}})
+    with db_transaction() as db:
+        db.execute('DELETE FROM posts')
+        db.execute('DELETE FROM characters')
+        db.execute('DELETE FROM client_map')
+        db.execute("DELETE FROM meta WHERE key IN ('scene_name', 'dm_notes', 'epoch')")
+        db.executemany(_POST_INSERT, [_post_row(p, to_json(p)) for p in posts_data])
+        db.executemany(_CHARACTER_INSERT,
+                       [(char_id, c.get('username'), c.get('name'), 1 if c.get('dead') else 0, to_json(c))
+                        for char_id, c in store['characters'].items()])
+        db.executemany('INSERT INTO client_map (client_id, character_id) VALUES (?, ?)',
+                       [(k, str(v)) for k, v in store['client_map'].items()])
+        if store.get('epoch'):
+            set_meta('epoch', str(store['epoch']))
+        if SCENE_JSON in files:
+            set_meta('scene_name', files[SCENE_JSON].get('scene_name', ''))
+        if DM_NOTES_JSON in files:
+            set_meta('dm_notes', files[DM_NOTES_JSON].get('notes', ''))
+        if DOCUMENTS_JSON in files:
+            db.execute('DELETE FROM documents')
+            db.executemany(_DOCUMENT_INSERT, document_rows(files[DOCUMENTS_JSON].get('documents', [])))
+
+
+def export_game_files():
+    """The game as it stands in the database, as {file name: JSON data}."""
+    with state_lock:
+        post_rows = _db.execute('SELECT data FROM posts ORDER BY seq, rowid').fetchall()
+        char_rows = _db.execute('SELECT id, data FROM characters').fetchall()
+        cmap = dict(_db.execute('SELECT client_id, character_id FROM client_map').fetchall())
+        doc_rows = _db.execute('SELECT id, file, title, shared, added FROM documents ORDER BY rowid').fetchall()
+        return {
+            POSTS_JSON: [json.loads(text) for (text,) in post_rows],
+            CHARACTERS_JSON: {'characters': {char_id: json.loads(text) for char_id, text in char_rows},
+                              'client_map': cmap, 'epoch': get_meta('epoch', 'initial')},
+            SCENE_JSON: {'scene_name': get_meta('scene_name')},
+            DM_NOTES_JSON: {'notes': get_meta('dm_notes')},
+            # Always written, even when empty, so importing the backup later
+            # also puts the documents back exactly as they were.
+            DOCUMENTS_JSON: {'documents': [{'id': i, 'file': f, 'title': t, 'shared': bool(sh), 'added': a}
+                                           for i, f, t, sh, a in doc_rows]},
+        }
+
+
+def migrate_legacy_json():
+    """One-time move from the JSON files and text log this app used to keep
+    in data/ into the database. Runs on the first start after upgrading:
+    everything is imported in one transaction, then the old files are moved
+    (never deleted) into data/legacy-json/<time>/ so you can check them and
+    remove them yourself. A damaged file stops the app before anything is
+    written, exactly as it did before. The documents themselves stay where
+    they are, in data/documents/."""
+    present = [name for name in STATE_JSON_FILES + (DOCUMENTS_JSON, ACTIVITY_LOG_TXT)
+               if os.path.exists(os.path.join(DATA_DIR, name))]
+    if not present:
+        return
+    with state_lock:
+        has_game = _db.execute('SELECT EXISTS (SELECT 1 FROM posts) OR EXISTS (SELECT 1 FROM characters) '
+                               'OR EXISTS (SELECT 1 FROM documents)').fetchone()[0]
+    if has_game or get_meta('migrated_from_json'):
+        print(f'[cairn] WARNING: ignoring old game files in {DATA_DIR} ({", ".join(present)}) '
+              'because the database already holds a game. Move them out of data/ to stop this warning.',
+              flush=True)
+        return
+
+    found = {}
+    for name in STATE_JSON_FILES + (DOCUMENTS_JSON,):
+        path = os.path.join(DATA_DIR, name)
+        if os.path.exists(path):
+            found[name] = load_json_file(path)
+    try:
+        check_game_files(found)
+    except BackupProblem as problem:
+        refuse_to_start_with_damaged_file(DATA_DIR, problem)
+
+    log_rows = []
+    log_path = os.path.join(DATA_DIR, ACTIVITY_LOG_TXT)
+    if os.path.exists(log_path):
+        with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+            log_rows = parse_activity_log(f.read())
+
+    with db_transaction() as db:
+        install_game_files(found)
+        db.executemany('INSERT INTO activity_log (ts, actor, action, details) VALUES (?, ?, ?, ?)', log_rows)
+        set_meta('migrated_from_json', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+
+    dest = os.path.join(LEGACY_DIR, datetime.now().strftime('%Y%m%d-%H%M%S'))
+    os.makedirs(dest, exist_ok=True)
+    for name in present:
         try:
-            os.remove(os.path.join(DATA_DIR, _name))
-            print(f'[cairn] removed leftover temp file {_name}')
-        except OSError:
-            pass
+            os.replace(os.path.join(DATA_DIR, name), os.path.join(dest, name))
+        except OSError as exc:
+            print(f'[cairn] imported but could not move {name}: {exc}', flush=True)
+    doc_count = len(found.get(DOCUMENTS_JSON, {}).get('documents', []))
+    print(f'[cairn] imported {len(found.get(POSTS_JSON, []))} post(s), '
+          f'{len(found[CHARACTERS_JSON]["characters"])} character(s), {doc_count} document entr(ies) '
+          f'and {len(log_rows)} log line(s) from the old JSON files; originals moved to {dest}', flush=True)
+
+
+migrate_legacy_json()
 
 posts = load_posts()
 characters, client_map = load_character_store()  # see load_character_store() docstring
 # Changes only when a backup is imported. Every open page was built from one
 # epoch; when the feed poll reports a different one, the page reloads itself
 # so nobody keeps looking at (or saving into) the game that was replaced.
-_raw_store = load_json_file(CHAR_FILE)
-state_epoch = (_raw_store.get('epoch') if isinstance(_raw_store, dict) else None) or 'initial'
-del _raw_store
+state_epoch = get_meta('epoch') or 'initial'
 scene_name = load_scene_name()
 dm_notes = load_dm_notes()
 _next_post_seq = (max((p.get('seq', -1) for p in posts), default=-1)) + 1
@@ -1429,24 +1792,27 @@ DOC_CSP = "script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'n
 # Table documents index
 # ---------------------------------------------------------------------------
 def load_documents():
-    data = load_json_file(DOCS_FILE)
-    raw = data.get('documents', []) if isinstance(data, dict) else []
-    docs = []
-    for d in raw if isinstance(raw, list) else []:
-        if not isinstance(d, dict) or not isinstance(d.get('file'), str) or not d['file']:
-            continue
-        docs.append({
-            'id': str(d.get('id') or secrets.token_hex(6)),
-            'file': d['file'],
-            'title': clean_text(str(d.get('title') or ''), MAX_DOC_TITLE) or title_from_filename(d['file']),
-            'shared': bool(d.get('shared')),
-            'added': str(d.get('added') or ''),
-        })
-    return docs
+    with state_lock:
+        try:
+            rows = _db.execute('SELECT id, file, title, shared, added FROM documents ORDER BY rowid').fetchall()
+        except sqlite3.Error as exc:
+            refuse_to_start_with_damaged_db(exc)
+    return [{
+        'id': doc_id,
+        'file': file,
+        'title': clean_text(title or '', MAX_DOC_TITLE) or title_from_filename(file),
+        'shared': bool(shared),
+        'added': added or '',
+    } for doc_id, file, title, shared, added in rows]
 
 
 def save_documents():
-    write_json_atomic(DOCS_FILE, {'documents': documents})
+    """Rewrite the document index. It's at most MAX_DOCUMENTS short rows, so
+    it's simply replaced whole rather than compared row by row."""
+    with db_transaction() as db:
+        db.execute('DELETE FROM documents')
+        db.executemany(_DOCUMENT_INSERT, [(d['id'], d['file'], d['title'], 1 if d['shared'] else 0, d['added'])
+                                          for d in documents])
 
 
 def title_from_filename(name):
@@ -5823,24 +6189,21 @@ def dm_post():
     return redirect(url_for('dm_home'))
 
 
-STATE_FILES = (DATA_FILE, CHAR_FILE, SCENE_FILE, DM_NOTES_FILE)
 AUTO_BACKUP_DIR = os.path.join(DATA_DIR, 'backups')
 DOCS_ARCHIVE_DIR = 'documents'
 
 
 def build_backup_zip():
-    """The same zip the DM downloads: every state file that exists, the
-    activity log, the documents index, and every table document under
-    documents/."""
+    """The zip the DM downloads: the game exported from the database as the
+    JSON files the app used to keep (see export_game_files), the activity
+    log as text, and every table document under documents/. Readable
+    without the app, and importable by it."""
     buf = io.BytesIO()
     with state_lock, zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for path in STATE_FILES + (LOG_FILE,):
-            if os.path.exists(path):
-                zf.write(path, arcname=os.path.basename(path))
         sync_documents()
-        # Always written, even when empty, so importing this backup later
-        # also puts the documents back exactly as they were.
-        zf.writestr(os.path.basename(DOCS_FILE), json.dumps({'documents': documents}, indent=2))
+        for name, data in export_game_files().items():
+            zf.writestr(name, json.dumps(data, indent=2, ensure_ascii=False))
+        zf.writestr(ACTIVITY_LOG_TXT, activity_log_text())
         for doc in documents:
             if os.path.isfile(doc_path(doc)):
                 zf.write(doc_path(doc), arcname=f'{DOCS_ARCHIVE_DIR}/{doc["file"]}')
@@ -5875,25 +6238,19 @@ def latest_auto_backup():
     return names[-1] if names else None
 
 
-class BackupProblem(ValueError):
-    """An uploaded backup that can't be used; the message is shown to the DM."""
-
-
-def read_backup_zip(data, require_game=True):
+def read_backup_zip(data):
     """Check an uploaded backup completely, before anything is changed.
-    Returns ({state file path: parsed JSON}, docs) where docs is None for a
-    backup made before table documents existed (the current documents are
-    then left alone), else {'index': [...], 'files': {name: bytes}}.
-    Raises BackupProblem with a readable reason otherwise."""
+    Returns ({file name: parsed JSON}, doc_files) where doc_files is None
+    for a backup made before table documents existed (the current documents
+    are then left alone), else {name: bytes}. Raises BackupProblem with a
+    readable reason otherwise."""
     try:
         zf = zipfile.ZipFile(io.BytesIO(data))
     except zipfile.BadZipFile:
         raise BackupProblem('That file isn\'t a zip. Use a backup made with Download Backup.')
 
-    wanted = {os.path.basename(path): path for path in STATE_FILES}
-    docs_name = os.path.basename(DOCS_FILE)
+    wanted = STATE_JSON_FILES + (DOCUMENTS_JSON,)
     found = {}
-    docs_index = None
     doc_files = {}
     total = 0
     with zf:
@@ -5909,9 +6266,9 @@ def read_backup_zip(data, require_game=True):
                     continue
                 if base in doc_files:
                     raise BackupProblem(f'The backup contains documents/{base} more than once.')
-            elif base != docs_name and base not in wanted:
+            elif base not in wanted:
                 continue  # the activity log and anything else are ignored
-            elif base in wanted and wanted[base] in found:
+            elif base in found:
                 raise BackupProblem(f'The backup contains {base} more than once.')
             total += info.file_size
             if total > IMPORT_MAX_UNCOMPRESSED:
@@ -5924,42 +6281,22 @@ def read_backup_zip(data, require_game=True):
                 doc_files[base] = raw
                 continue
             try:
-                parsed = json.loads(raw.decode('utf-8'))
+                found[base] = json.loads(raw.decode('utf-8'))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 raise BackupProblem(f'{base} in the backup isn\'t valid JSON.')
-            if base == docs_name:
-                if not isinstance(parsed, dict) or not isinstance(parsed.get('documents', []), list):
-                    raise BackupProblem(f'{docs_name} in the backup is not in the expected format.')
-                docs_index = parsed.get('documents', [])
-            else:
-                found[wanted[base]] = parsed
 
-    if not found and require_game:
+    if not any(name in found for name in STATE_JSON_FILES):
         raise BackupProblem('No game files found in that zip. Use a backup made with Download Backup.')
-
-    posts_data = found.get(DATA_FILE, [])
-    if not isinstance(posts_data, list) or not all(isinstance(p, dict) for p in posts_data):
-        raise BackupProblem(f'{os.path.basename(DATA_FILE)} in the backup is not a list of posts.')
-
-    store = found.get(CHAR_FILE, {'characters': {}, 'client_map': {}})
-    if (not isinstance(store, dict) or not isinstance(store.get('characters'), dict)
-            or not isinstance(store.get('client_map', {}), dict)
-            or not all(isinstance(c, dict) for c in store['characters'].values())):
-        raise BackupProblem(f'{os.path.basename(CHAR_FILE)} in the backup is not a character file.')
-    store.setdefault('client_map', {})
-    found[CHAR_FILE] = store
-
-    for path, key in ((SCENE_FILE, 'scene_name'), (DM_NOTES_FILE, 'notes')):
-        if path in found and not (isinstance(found[path], dict) and isinstance(found[path].get(key, ''), str)):
-            raise BackupProblem(f'{os.path.basename(path)} in the backup is not in the expected format.')
-
-    docs = None if docs_index is None else {'index': docs_index, 'files': doc_files}
-    return found, docs
+    try:
+        check_game_files(found)
+    except BackupProblem as problem:
+        raise BackupProblem(f'In the backup, {problem}')
+    return found, (doc_files if DOCUMENTS_JSON in found else None)
 
 
 def reload_state_from_disk():
-    """Re-read every state file into memory (running the same upgrades as
-    startup), and forget anything tied to the old game."""
+    """Re-read the whole game from the database into memory (running the
+    same upgrades as startup), and forget anything tied to the old game."""
     global posts, characters, client_map, scene_name, dm_notes, _next_post_seq, _feed_change
     posts = load_posts()
     characters, client_map = load_character_store()
@@ -5973,41 +6310,39 @@ def reload_state_from_disk():
         _pending_rolls.clear()
 
 
+def snapshot_state():
+    """Everything reload_state_from_disk() replaces, including what the save
+    functions remember writing, so a failed import can be undone exactly."""
+    return (posts, characters, client_map, scene_name, dm_notes, _next_post_seq, _feed_change,
+            _written_posts, _written_characters, _written_client_map, list(documents))
+
+
 def put_back_state(before):
     global posts, characters, client_map, scene_name, dm_notes, _next_post_seq, _feed_change
-    posts, characters, client_map, scene_name, dm_notes, _next_post_seq, _feed_change, docs = before
+    global _written_posts, _written_characters, _written_client_map
+    (posts, characters, client_map, scene_name, dm_notes, _next_post_seq, _feed_change,
+     _written_posts, _written_characters, _written_client_map, docs) = before
     documents[:] = docs
 
 
-def install_game_files(files, docs):
-    """Make the state files on disk exactly the given ones: written
-    atomically, and any state file not in `files` removed (the backup was
-    made before that file existed, so that part of the game was empty).
-    With `docs`, the documents folder is replaced too; without, it's kept."""
-    for path in STATE_FILES:
-        if path in files:
-            write_json_atomic(path, files[path])
-        elif os.path.exists(path):
-            os.remove(path)
-    if docs is None:
-        return
+def read_doc_files():
+    """Every file in the documents folder, as {name: bytes}."""
+    files = {}
+    for name in doc_folder_files():
+        with open(os.path.join(DOCS_DIR, name), 'rb') as f:
+            files[name] = f.read()
+    return files
+
+
+def install_doc_files(files):
+    """Make the documents folder hold exactly `files` ({name: bytes}). The
+    files can't be part of a database transaction, so an import keeps the
+    old ones in memory (read_doc_files) to put back if it fails."""
     for name in doc_folder_files():
         os.remove(os.path.join(DOCS_DIR, name))
-    for name, data in docs['files'].items():
+    for name, data in files.items():
         with open(os.path.join(DOCS_DIR, name), 'wb') as f:
             f.write(data)
-    write_json_atomic(DOCS_FILE, {'documents': docs['index']})
-
-
-def restore_backup_bytes(data):
-    """Put a zip made by build_backup_zip() back on disk, as is."""
-    files, docs = read_backup_zip(data, require_game=False)
-    # read_backup_zip fills in an empty character file; put back only what
-    # was really there.
-    with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        names = {os.path.basename(n) for n in zf.namelist()}
-    files = {path: value for path, value in files.items() if os.path.basename(path) in names}
-    install_game_files(files, docs)
 
 
 def dm_form_token():
@@ -6044,7 +6379,7 @@ def dm_import_backup():
         return redirect(url_for('dm_home'))
 
     try:
-        files, docs = read_backup_zip(data)
+        files, doc_files = read_backup_zip(data)
     except BackupProblem as problem:
         log_activity('DM', 'BACKUP_IMPORT_REFUSED', str(problem))
         flash(f'Nothing was changed. {problem}')
@@ -6052,31 +6387,37 @@ def dm_import_backup():
 
     with state_lock:
         saved_as = save_auto_backup('before-import')
-        previous = build_backup_zip()
-        # The live game, kept so a failed import can be undone without
-        # re-running any loader (which might be what failed).
-        before = (posts, characters, client_map, scene_name, dm_notes, _next_post_seq, _feed_change,
-                  list(documents))
+        # The live game in memory, kept so a failed import can be undone
+        # without re-running any loader (which might be what failed). The
+        # database needs no copy: the whole import is one transaction, and a
+        # failure rolls it back. The document files aren't in the database,
+        # so the current ones are kept in memory to put back.
+        before = snapshot_state()
+        previous_doc_files = read_doc_files() if doc_files is not None else None
+        new_epoch = secrets.token_hex(8)
         try:
-            install_game_files(files, docs)
-            reload_state_from_disk()
+            with db_transaction():
+                install_game_files(files)
+                if doc_files is not None:
+                    install_doc_files(doc_files)
+                reload_state_from_disk()  # also writes any upgrades the loader made
+                set_meta('epoch', new_epoch)
         except BaseException as exc:  # includes the loaders' SystemExit
-            restore_backup_bytes(previous)
+            if previous_doc_files is not None:
+                install_doc_files(previous_doc_files)
             put_back_state(before)
-            log_activity('DM', 'BACKUP_IMPORT_FAILED', f'{type(exc).__name__}: {exc}; previous game restored')
+            log_activity('DM', 'BACKUP_IMPORT_FAILED', f'{type(exc).__name__}: {exc}; previous game kept')
             flash('That backup could not be loaded, so the previous game was put back unchanged.')
             return redirect(url_for('dm_home'))
+        state_epoch = new_epoch
 
-        state_epoch = secrets.token_hex(8)
-        save_characters()  # records the new epoch (and any upgrades the loader made)
-
-    doc_note = (f', documents={len(documents)}' if docs is not None
+    doc_note = (f', documents={len(documents)}' if doc_files is not None
                 else ', documents kept (backup has none)')
     log_activity('DM', 'BACKUP_IMPORTED',
                  f'file="{clean_text(upload.filename, 120)}", characters={len(characters)}, posts={len(posts)}'
                  f'{doc_note}, previous game saved as backups/{saved_as}')
     flash(f'Backup imported: {len(characters)} character(s), {len(posts)} post(s)'
-          + (f', {len(documents)} document(s). ' if docs is not None
+          + (f', {len(documents)} document(s). ' if doc_files is not None
              else '. It had no table documents, so yours were kept. ') +
           f'Everyone\'s open pages will reload. The previous game was saved first — '
           f'use "Download previous game" to get it back.')
